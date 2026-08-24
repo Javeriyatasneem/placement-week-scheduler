@@ -13,12 +13,12 @@ import java.util.Set;
  */
 public class ReplanResult {
 
-    private final PanelDropDisruption disruption;
+    private final Disruption disruption;
     private final List<RepairOutcome> repairOutcomes; // Tier 1 + Tier 2 + Tier 3, in that processing order
     private final int lockedInterviewCount;
     private final Set<String> studentsToNotify;
 
-    public ReplanResult(PanelDropDisruption disruption, List<RepairOutcome> repairOutcomes,
+    public ReplanResult(Disruption disruption, List<RepairOutcome> repairOutcomes,
                          int lockedInterviewCount, Set<String> studentsToNotify) {
         this.disruption = disruption;
         this.repairOutcomes = repairOutcomes;
@@ -26,7 +26,7 @@ public class ReplanResult {
         this.studentsToNotify = studentsToNotify;
     }
 
-    public PanelDropDisruption getDisruption() { return disruption; }
+    public Disruption getDisruption() { return disruption; }
     public List<RepairOutcome> getRepairOutcomes() { return repairOutcomes; }
     public int getLockedInterviewCount() { return lockedInterviewCount; }
     public Set<String> getStudentsToNotify() { return studentsToNotify; }

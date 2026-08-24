@@ -8,15 +8,15 @@ import com.mirailabs.placement_scheduler.scheduler.SchedulingEngine;
 import java.util.*;
 
 /**
- * Handles replanning after a disruption. Currently supports PANEL DROP only
- * (student withdrawal, company delay, room block are NOT implemented yet -
+ * Handles replanning after a disruption. Currently supports PANEL DROP and
+ * ROOM BLOCK (student withdrawal and company delay are NOT implemented yet -
  * by design, per current scope).
  *
  * Reuses the SAME live OccupancyTracker instances from the SchedulingEngine
  * that produced the original schedule - we do NOT rebuild occupancy from
  * scratch. This is what lets us do a scoped repair instead of a full re-solve.
  *
- * ARCHITECTURAL NOTE: Company.getDay() is a single fixed value - a company
+ * ARCHITECTURAL NOTE: Company.gSetDay() is a single fixed value - a company
  * only ever operates on one day. This means a genuine "different day" repair
  * is not reachable in the current model (there's nowhere else for that
  * company's interview to go). Tier 2 below searches only within the
@@ -108,6 +108,157 @@ public class ReplanEngine {
 
         return new ReplanResult(disruption, outcomes, lockedCount, studentsToNotify);
     }
+
+    public ReplanResult replanForRoomBlock(RoomBlockDisruption disruption, Dataset dataset,
+                                            List<Interview> currentSchedule) {
+
+        Map<String, Company> companiesById = new HashMap<>();
+        for (Company c : dataset.getCompanies()) {
+            companiesById.put(c.getId(), c);
+        }
+
+        // Apply the block itself - room is unavailable for the rest of this day.
+        Room blockedRoom = findRoom(dataset, disruption.getRoomId());
+        if (blockedRoom != null) {
+            blockedRoom.blockFrom(disruption.getDisruptionDay(), disruption.getDisruptionUnit());
+        }
+
+        // Partition into LOCKED vs AFFECTED. A room block is day-scoped, so
+        // interviews in this room on OTHER days are untouched - unlike the
+        // panel drop, which was permanent from its trigger point onward.
+        List<Interview> affected = new ArrayList<>();
+        int lockedCount = 0;
+        for (Interview interview : currentSchedule) {
+            boolean inBlockedRoom = interview.getRoomId().equals(disruption.getRoomId());
+            boolean sameDay = interview.getTimeSlot().getDay() == disruption.getDisruptionDay();
+            boolean overlapsBlock = interview.getTimeSlot().getEndUnit() > disruption.getDisruptionUnit();
+            if (inBlockedRoom && sameDay && overlapsBlock) {
+                affected.add(interview);
+            } else {
+                lockedCount++;
+            }
+        }
+
+        List<RepairOutcome> outcomes = new ArrayList<>();
+        Set<String> studentsToNotify = new TreeSet<>();
+
+        for (Interview original : affected) {
+            studentsToNotify.add(original.getStudentId());
+
+            studentOccupancy.release(original.getStudentId(), original.getTimeSlot());
+            panelOccupancy.release(original.getPanelId(), original.getTimeSlot());
+            roomOccupancy.release(original.getRoomId(), original.getTimeSlot());
+
+            Company company = companiesById.get(original.getCompanyId());
+            if (company == null) {
+                outcomes.add(new RepairOutcome(original, null, RepairOutcome.Tier.TIER_3_UNSCHEDULED,
+                        "Owning company for this interview could not be resolved"));
+                continue;
+            }
+
+            // ---- DIAGNOSTIC ONLY: read-only snapshot, no state mutation, ----
+            // ---- computed BEFORE any repair attempt so it reflects true  ----
+            // ---- pre-repair conditions. Mirrors tryRoomTier1's own filter ----
+            // ---- logic exactly, so these counts are guaranteed accurate. ----
+            TimeSlot slot = original.getTimeSlot();
+            int totalRooms = dataset.getRooms().size();
+            int blockedAtSlot = 0;
+            int occupiedAtSlot = 0;
+            int freeAlternatives = 0;
+            for (Room r : dataset.getRooms()) {
+                if (r.getId().equals(original.getRoomId())) {
+                    continue; // the disrupted room itself is not an "alternative"
+                }
+                if (isRoomBlocked(r, slot)) {
+                    blockedAtSlot++;
+                } else if (!roomOccupancy.isFree(r.getId(), slot)) {
+                    occupiedAtSlot++;
+                } else {
+                    freeAlternatives++;
+                }
+            }
+            long activePanelCount = company.getPanels().stream().filter(Panel::isActive).count();
+
+//            System.out.println("--- DIAGNOSTIC for " + original + " ---");
+            System.out.println("  1. Original slot: " + slot);
+            System.out.println("  2. Total rooms: " + totalRooms);
+            System.out.println("  3. Rooms blocked at this exact slot: " + blockedAtSlot);
+            System.out.println("  4. Rooms occupied (by another interview) at this exact slot: " + occupiedAtSlot);
+            System.out.println("  5. Genuinely free/unblocked alternative rooms: " + freeAlternatives);
+            System.out.println("  6. Active panels for company " + company.getId() + ": " + activePanelCount);
+            // ---- END DIAGNOSTIC ----
+
+            Optional<Interview> tier1 = tryRoomTier1(original, dataset.getRooms());
+            if (tier1.isPresent()) {
+                outcomes.add(new RepairOutcome(original, tier1.get(), RepairOutcome.Tier.TIER_1_SAME_SLOT_ALT_PANEL, null));
+                continue;
+            }
+
+            Optional<Interview> tier2 = tryTier2(original, company, dataset.getRooms());
+            // ---- DIAGNOSTIC ONLY: reports the already-computed result, ----
+            // ---- does not trigger an extra search call. ----
+            System.out.println("  7. Tier 2 found a feasible (time, panel, room) combination: " + tier2.isPresent());
+            if (tier2.isPresent()) {
+                outcomes.add(new RepairOutcome(original, tier2.get(), RepairOutcome.Tier.TIER_2_NEAREST_ALTERNATIVE, null));
+                continue;
+            }
+
+            outcomes.add(new RepairOutcome(original, null, RepairOutcome.Tier.TIER_3_UNSCHEDULED,
+                    "Room " + disruption.getRoomId() + " became unavailable from Day " + disruption.getDisruptionDay()
+                            + " onward; no alternate room or time slot could be found for this interview"));
+        }
+
+        return new ReplanResult(disruption, outcomes, lockedCount, studentsToNotify);
+    }
+
+    private Room findRoom(Dataset dataset, String roomId) {
+        for (Room r : dataset.getRooms()) {
+            if (r.getId().equals(roomId)) {
+                return r;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * ROOM-BLOCK TIER 1: same day, same start time, same panel, same student -
+     * only the room changes. Panel-fixed by design (mirrors panel-drop's
+     * Tier 1, with room/panel roles swapped). Deterministic: lowest room ID
+     * wins among free, unblocked alternatives.
+     */
+    private Optional<Interview> tryRoomTier1(Interview original, List<Room> rooms) {
+        TimeSlot slot = original.getTimeSlot();
+
+        if (!panelOccupancy.isFree(original.getPanelId(), slot)) {
+            return Optional.empty(); // panel itself no longer free at this slot - Tier 1 can't hold panel fixed
+        }
+
+        List<Room> candidates = new ArrayList<>();
+        for (Room room : rooms) {
+            if (room.getId().equals(original.getRoomId())) {
+                continue; // the disrupted room itself is never a valid candidate
+            }
+            if (isRoomBlocked(room, slot)) {
+                continue;
+            }
+            if (roomOccupancy.isFree(room.getId(), slot)) {
+                candidates.add(room);
+            }
+        }
+        if (candidates.isEmpty()) {
+            return Optional.empty();
+        }
+        candidates.sort(Comparator.comparing(Room::getId));
+        Room chosen = candidates.get(0);
+
+        return bookRepair(original, original.getPanelId(), chosen.getId(), slot);
+    }
+
+    /**
+     * ReplanResult#getDisruption() is typed generically enough that either
+     * disruption's toString() flows through unchanged - no ReplanResult
+     * changes were needed for room-block support.
+     */
 
     /** True if this slot is at or after the disruption point (same day+unit or later). */
     private boolean isAtOrAfter(TimeSlot slot, PanelDropDisruption disruption) {

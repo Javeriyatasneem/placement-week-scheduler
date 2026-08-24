@@ -8,7 +8,7 @@ package com.mirailabs.placement_scheduler.replan;
  * they're in the LOCKED set, untouched. Interviews AT or AFTER it are in
  * the AFFECTED set and need a repair attempt.
  */
-public class PanelDropDisruption {
+public class PanelDropDisruption implements Disruption {
 
     private final String panelId;
     private final int disruptionDay;
