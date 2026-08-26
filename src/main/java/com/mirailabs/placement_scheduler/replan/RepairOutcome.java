@@ -13,13 +13,14 @@ public class RepairOutcome {
     public enum Tier {
         TIER_1_SAME_SLOT_ALT_PANEL,
         TIER_2_NEAREST_ALTERNATIVE,
-        TIER_3_UNSCHEDULED
+        TIER_3_UNSCHEDULED,
+        CANCELLED_WITHDRAWN
     }
 
     private final Interview originalInterview;
-    private final Interview newInterview; // null if Tier 3
+    private final Interview newInterview; // null if Tier 3 or CANCELLED_WITHDRAWN
     private final Tier tier;
-    private final String reason; // only meaningful for Tier 3
+    private final String reason; // meaningful for Tier 3 and CANCELLED_WITHDRAWN
 
     public RepairOutcome(Interview originalInterview, Interview newInterview, Tier tier, String reason) {
         this.originalInterview = originalInterview;
@@ -34,11 +35,14 @@ public class RepairOutcome {
     public String getReason() { return reason; }
 
     public boolean isRepaired() {
-        return tier != Tier.TIER_3_UNSCHEDULED;
+        return tier != Tier.TIER_3_UNSCHEDULED && tier != Tier.CANCELLED_WITHDRAWN;
     }
 
     @Override
     public String toString() {
+        if (tier == Tier.CANCELLED_WITHDRAWN) {
+            return "CANCELLED (was: " + originalInterview + ") -> " + reason;
+        }
         if (tier == Tier.TIER_3_UNSCHEDULED) {
             return "UNSCHEDULED (was: " + originalInterview + ") -> " + reason;
         }

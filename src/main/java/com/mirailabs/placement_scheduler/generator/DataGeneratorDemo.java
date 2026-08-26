@@ -6,11 +6,8 @@ import com.mirailabs.placement_scheduler.model.Student;
 
 import java.util.*;
 
-/**
- * Run this directly (right-click -> Run As -> Java Application in Eclipse)
- * to sanity-check the generator's output BEFORE wiring it into Spring.
- * No Spring context needed - it's a plain main() method.
- */
+//Small demo used to check the generated dataset before running the scheduler.
+
 public class DataGeneratorDemo {
 
     public static void main(String[] args) {

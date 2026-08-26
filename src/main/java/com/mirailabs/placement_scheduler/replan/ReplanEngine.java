@@ -8,15 +8,14 @@ import com.mirailabs.placement_scheduler.scheduler.SchedulingEngine;
 import java.util.*;
 
 /**
- * Handles replanning after a disruption. Currently supports PANEL DROP and
- * ROOM BLOCK (student withdrawal and company delay are NOT implemented yet -
- * by design, per current scope).
+ * Handles replanning after all four disruption types: panel drop, room
+ * block, student withdrawal, and company delay.
  *
  * Reuses the SAME live OccupancyTracker instances from the SchedulingEngine
  * that produced the original schedule - we do NOT rebuild occupancy from
  * scratch. This is what lets us do a scoped repair instead of a full re-solve.
  *
- * ARCHITECTURAL NOTE: Company.gSetDay() is a single fixed value - a company
+ * ARCHITECTURAL NOTE: Company.getDay() is a single fixed value - a company
  * only ever operates on one day. This means a genuine "different day" repair
  * is not reachable in the current model (there's nowhere else for that
  * company's interview to go). Tier 2 below searches only within the
@@ -156,38 +155,6 @@ public class ReplanEngine {
                 continue;
             }
 
-            // ---- DIAGNOSTIC ONLY: read-only snapshot, no state mutation, ----
-            // ---- computed BEFORE any repair attempt so it reflects true  ----
-            // ---- pre-repair conditions. Mirrors tryRoomTier1's own filter ----
-            // ---- logic exactly, so these counts are guaranteed accurate. ----
-            TimeSlot slot = original.getTimeSlot();
-            int totalRooms = dataset.getRooms().size();
-            int blockedAtSlot = 0;
-            int occupiedAtSlot = 0;
-            int freeAlternatives = 0;
-            for (Room r : dataset.getRooms()) {
-                if (r.getId().equals(original.getRoomId())) {
-                    continue; // the disrupted room itself is not an "alternative"
-                }
-                if (isRoomBlocked(r, slot)) {
-                    blockedAtSlot++;
-                } else if (!roomOccupancy.isFree(r.getId(), slot)) {
-                    occupiedAtSlot++;
-                } else {
-                    freeAlternatives++;
-                }
-            }
-            long activePanelCount = company.getPanels().stream().filter(Panel::isActive).count();
-
-//            System.out.println("--- DIAGNOSTIC for " + original + " ---");
-            System.out.println("  1. Original slot: " + slot);
-            System.out.println("  2. Total rooms: " + totalRooms);
-            System.out.println("  3. Rooms blocked at this exact slot: " + blockedAtSlot);
-            System.out.println("  4. Rooms occupied (by another interview) at this exact slot: " + occupiedAtSlot);
-            System.out.println("  5. Genuinely free/unblocked alternative rooms: " + freeAlternatives);
-            System.out.println("  6. Active panels for company " + company.getId() + ": " + activePanelCount);
-            // ---- END DIAGNOSTIC ----
-
             Optional<Interview> tier1 = tryRoomTier1(original, dataset.getRooms());
             if (tier1.isPresent()) {
                 outcomes.add(new RepairOutcome(original, tier1.get(), RepairOutcome.Tier.TIER_1_SAME_SLOT_ALT_PANEL, null));
@@ -195,9 +162,6 @@ public class ReplanEngine {
             }
 
             Optional<Interview> tier2 = tryTier2(original, company, dataset.getRooms());
-            // ---- DIAGNOSTIC ONLY: reports the already-computed result, ----
-            // ---- does not trigger an extra search call. ----
-            System.out.println("  7. Tier 2 found a feasible (time, panel, room) combination: " + tier2.isPresent());
             if (tier2.isPresent()) {
                 outcomes.add(new RepairOutcome(original, tier2.get(), RepairOutcome.Tier.TIER_2_NEAREST_ALTERNATIVE, null));
                 continue;
@@ -209,6 +173,162 @@ public class ReplanEngine {
         }
 
         return new ReplanResult(disruption, outcomes, lockedCount, studentsToNotify);
+    }
+
+    public ReplanResult replanForStudentWithdrawal(StudentWithdrawalDisruption disruption, Dataset dataset,
+                                                     List<Interview> currentSchedule) {
+
+        Student student = findStudent(dataset, disruption.getStudentId());
+        if (student != null) {
+            student.setWithdrawn(true);
+        }
+
+        // Partition into LOCKED vs AFFECTED. Unlike panel-drop/room-block,
+        // AFFECTED here spans ALL remaining days, not just the disruption
+        // day - withdrawal is permanent for the rest of the event.
+        List<Interview> affected = new ArrayList<>();
+        int lockedCount = 0;
+        for (Interview interview : currentSchedule) {
+            boolean isThisStudent = interview.getStudentId().equals(disruption.getStudentId());
+            boolean atOrAfter = isAtOrAfterWithdrawal(interview.getTimeSlot(), disruption);
+            if (isThisStudent && atOrAfter) {
+                affected.add(interview);
+            } else {
+                lockedCount++;
+            }
+        }
+
+        List<RepairOutcome> outcomes = new ArrayList<>();
+        Set<String> studentsToNotify = new TreeSet<>();
+
+        for (Interview original : affected) {
+            studentsToNotify.add(original.getStudentId());
+
+            // Release resources - NOT backfilled, per the no-cascade rule.
+            studentOccupancy.release(original.getStudentId(), original.getTimeSlot());
+            panelOccupancy.release(original.getPanelId(), original.getTimeSlot());
+            roomOccupancy.release(original.getRoomId(), original.getTimeSlot());
+
+            // No repair attempted at all - this is a cancellation, not a
+            // search for an alternative. The student isn't looking for a
+            // new slot; they're gone.
+            outcomes.add(new RepairOutcome(original, null, RepairOutcome.Tier.CANCELLED_WITHDRAWN,
+                    "Student withdrew as of Day " + disruption.getDisruptionDay() + ", unit "
+                            + disruption.getDisruptionUnit() + "; interview cancelled"));
+        }
+
+        return new ReplanResult(disruption, outcomes, lockedCount, studentsToNotify);
+    }
+
+    public ReplanResult replanForCompanyDelay(CompanyDelayDisruption disruption, Dataset dataset,
+                                               List<Interview> currentSchedule) {
+
+        Map<String, Company> companiesById = new HashMap<>();
+        for (Company c : dataset.getCompanies()) {
+            companiesById.put(c.getId(), c);
+        }
+
+        Company company = companiesById.get(disruption.getCompanyId());
+        if (company != null) {
+            company.setDelayInUnits(disruption.getDelayUntilUnit());
+        }
+
+        // Partition into LOCKED vs AFFECTED. Only this company's interviews
+        // that start BEFORE the delay threshold are affected - anything
+        // already at/after it is fine as scheduled.
+        List<Interview> affected = new ArrayList<>();
+        int lockedCount = 0;
+        for (Interview interview : currentSchedule) {
+            boolean isThisCompany = interview.getCompanyId().equals(disruption.getCompanyId());
+            boolean startsBeforeDelay = interview.getTimeSlot().getStartUnit() < disruption.getDelayUntilUnit();
+            if (isThisCompany && startsBeforeDelay) {
+                affected.add(interview);
+            } else {
+                lockedCount++;
+            }
+        }
+
+        List<RepairOutcome> outcomes = new ArrayList<>();
+        Set<String> studentsToNotify = new TreeSet<>();
+
+        for (Interview original : affected) {
+            studentsToNotify.add(original.getStudentId());
+
+            studentOccupancy.release(original.getStudentId(), original.getTimeSlot());
+            panelOccupancy.release(original.getPanelId(), original.getTimeSlot());
+            roomOccupancy.release(original.getRoomId(), original.getTimeSlot());
+
+            if (company == null) {
+                outcomes.add(new RepairOutcome(original, null, RepairOutcome.Tier.TIER_3_UNSCHEDULED,
+                        "Owning company for this interview could not be resolved"));
+                continue;
+            }
+
+            Optional<Interview> tier1 = tryDelayTier1(original, disruption.getDelayUntilUnit());
+            if (tier1.isPresent()) {
+                outcomes.add(new RepairOutcome(original, tier1.get(), RepairOutcome.Tier.TIER_1_SAME_SLOT_ALT_PANEL, null));
+                continue;
+            }
+
+            Optional<Interview> tier2 = tryTier2(original, company, dataset.getRooms(), disruption.getDelayUntilUnit());
+            if (tier2.isPresent()) {
+                outcomes.add(new RepairOutcome(original, tier2.get(), RepairOutcome.Tier.TIER_2_NEAREST_ALTERNATIVE, null));
+                continue;
+            }
+
+            outcomes.add(new RepairOutcome(original, null, RepairOutcome.Tier.TIER_3_UNSCHEDULED,
+                    "Company delayed until unit " + disruption.getDelayUntilUnit()
+                            + "; no feasible panel/room/time slot found at or after the delay threshold"));
+        }
+
+        return new ReplanResult(disruption, outcomes, lockedCount, studentsToNotify);
+    }
+
+    private Student findStudent(Dataset dataset, String studentId) {
+        for (Student s : dataset.getStudents()) {
+            if (s.getId().equals(studentId)) {
+                return s;
+            }
+        }
+        return null;
+    }
+
+    /** True if this slot is at or after the withdrawal point (same day+unit or a later day). */
+    private boolean isAtOrAfterWithdrawal(TimeSlot slot, StudentWithdrawalDisruption disruption) {
+        if (slot.getDay() != disruption.getDisruptionDay()) {
+            return slot.getDay() > disruption.getDisruptionDay();
+        }
+        return slot.getStartUnit() >= disruption.getDisruptionUnit();
+    }
+
+    /**
+     * DELAY TIER 1: same panel, same room - search forward from the delay
+     * threshold for the EARLIEST feasible start (not "old start + delay
+     * offset", which could land on an already-booked slot). First free hit
+     * at or after minStartUnit wins.
+     */
+    private Optional<Interview> tryDelayTier1(Interview original, int minStartUnit) {
+        int day = original.getTimeSlot().getDay();
+        int durationUnits = original.getTimeSlot().getEndUnit() - original.getTimeSlot().getStartUnit();
+        int earliestPossible = Math.max(minStartUnit, 0);
+
+        for (int start = earliestPossible; start + durationUnits <= TimeGrid.UNITS_PER_DAY; start++) {
+            TimeSlot candidateSlot = new TimeSlot(day, start, start + durationUnits);
+
+            if (!studentOccupancy.isFree(original.getStudentId(), candidateSlot)) {
+                continue;
+            }
+            if (!panelOccupancy.isFree(original.getPanelId(), candidateSlot)) {
+                continue;
+            }
+            if (!roomOccupancy.isFree(original.getRoomId(), candidateSlot)) {
+                continue;
+            }
+
+            return bookRepair(original, original.getPanelId(), original.getRoomId(), candidateSlot);
+        }
+
+        return Optional.empty();
     }
 
     private Room findRoom(Dataset dataset, String roomId) {
@@ -322,6 +442,17 @@ public class ReplanEngine {
      * slots that are already free.
      */
     private Optional<Interview> tryTier2(Interview original, Company company, List<Room> rooms) {
+        return tryTier2(original, company, rooms, 0);
+    }
+
+    /**
+     * Overload with an explicit minStartUnit floor, used by company-delay
+     * replanning so no candidate before the delay threshold is ever
+     * considered - regardless of how "close" it'd otherwise rank. Existing
+     * callers (panel-drop, room-block) use the 0-floor overload above,
+     * unchanged.
+     */
+    private Optional<Interview> tryTier2(Interview original, Company company, List<Room> rooms, int minStartUnit) {
         TimeSlot originalSlot = original.getTimeSlot();
         int day = company.getDay();
         int durationUnits = company.getInterviewDurationUnits();
@@ -341,7 +472,7 @@ public class ReplanEngine {
         // Build every valid candidate start unit for this day, then rank by
         // proximity per the policy above.
         List<Integer> candidateStarts = new ArrayList<>();
-        for (int start = 0; start + durationUnits <= TimeGrid.UNITS_PER_DAY; start++) {
+        for (int start = Math.max(minStartUnit, 0); start + durationUnits <= TimeGrid.UNITS_PER_DAY; start++) {
             candidateStarts.add(start);
         }
         candidateStarts.sort((a, b) -> {

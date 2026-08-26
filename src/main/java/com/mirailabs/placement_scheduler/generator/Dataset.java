@@ -6,10 +6,7 @@ import com.mirailabs.placement_scheduler.model.Student;
 
 import java.util.List;
 
-/**
- * Simple bundle of everything the generator produces. Passed into the
- * scheduler as its input.
- */
+//Holds the data used by the scheduling engine.
 public class Dataset {
     private final List<Company> companies;
     private final List<Student> students;

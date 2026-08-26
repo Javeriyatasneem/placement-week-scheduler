@@ -12,10 +12,6 @@ import java.util.*;
  *  - Shortlists: a few "topper" students get 8-10 shortlists,
  *    most students get 2-4 - this creates the overlap problem
  *    the scheduler has to deal with.
- *
- * Deliberately NOT using purely uniform randomness anywhere a real
- * placement drive wouldn't look uniform - that's the "realism" the
- * assignment is grading.
  */
 public class DataGenerator {
 
@@ -46,9 +42,7 @@ public class DataGenerator {
     private final Random random;
 
     public DataGenerator(long seed) {
-        // seeded RNG - IMPORTANT: use a fixed seed while developing so your
-        // scheduler tests are reproducible. Switch to `new Random()` (no seed)
-        // if you want a fresh random dataset each run once things are stable.
+         // Fixed seed keeps the generated data consistent while testing.
         this.random = new Random(seed);
     }
 
@@ -65,20 +59,16 @@ public class DataGenerator {
         List<Company> companies = new ArrayList<>();
         int companyCounter = 1;
 
-        // Day 1: mass recruiters only (12 companies) - real placement weeks
-        // front-load high-volume recruiters so the bulk of students clear
-        // early.
+     // Day 1 has the highest-volume recruiters.
         companies.addAll(buildTier(companyCounter, MASS_RECRUITER_NAMES, PriorityTier.MASS_RECRUITER, 1));
         companyCounter += MASS_RECRUITER_NAMES.length;
 
-        // Day 2-3: mid tier (11 companies), spread across both days
+      // Mid-tier companies are distributed between Days 2 and 3.
         List<Company> midTier = buildTier(companyCounter, MID_TIER_NAMES, PriorityTier.MID_TIER, 2);
         companyCounter += MID_TIER_NAMES.length;
         companies.addAll(midTier);
 
-        // Day 4: dream companies (12 companies) - fewer positions, pickier,
-        // scheduled last since most students who wanted a "safe" offer
-        // already have one by now.
+     // Dream companies are scheduled on Day 4.
         companies.addAll(buildTier(companyCounter, DREAM_COMPANY_NAMES, PriorityTier.DREAM_COMPANY, 4));
 
         return companies;
@@ -205,29 +195,15 @@ public class DataGenerator {
         double clamped = Math.max(5.0, Math.min(9.9, raw));
         return Math.round(clamped * 100.0) / 100.0;
     }
-
+    
     /**
-     * Number of shortlists correlates with CGPA: toppers get shortlisted by
-     * more companies. We compute a base count from CGPA, add some noise,
-     * then only shortlist into companies the student is actually eligible
-     * for (cgpa cutoff + branch match) - mirrors how real off-campus/on-campus
-     * shortlisting works.
-     */
-    /**
-     * Number of shortlists correlates with CGPA: toppers get shortlisted by
-     * more companies. We compute a base count from CGPA, add some noise,
-     * then distribute that count ACROSS TIERS rather than pooling all
-     * eligible companies together and shuffling blindly.
+     * Generates the data used by the placement scheduler.
      *
-     * WHY: mass recruiters (low cutoff, open to all branches) are eligible
-     * for almost every student. A blind pooled shuffle massively
-     * over-represents them, dumping ~90% of demand onto Day 1 while Day 4
-     * sits mostly empty. Real students don't shortlist to 8 different mass
-     * recruiters either - they spread across a few safe options, some
-     * mid-tier, and a couple of aspirational picks. Capping the mass-tier
-     * quota fixes both the realism and the demand-distribution problem at
-     * the same time.
+     * The generated data is intentionally varied so that the scheduler
+     * has to handle different company tiers, student eligibility and
+     * competition for rooms and panels.
      */
+    
     private void assignShortlists(Student student, List<Company> companies) {
         double scaled = (student.getCgpa() - 5.0) / (9.9 - 5.0); // 0.0 to 1.0
         int baseTarget = 2 + (int) Math.round(scaled * 7);       // 2 to 9
