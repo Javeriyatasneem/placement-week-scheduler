@@ -3,236 +3,251 @@
 ## 1. Project Overview
 
 This project is a scheduling and replanning system for a college placement
-week: a multi-day event where a fixed number of companies interview a large
-pool of shortlisted students across a limited set of rooms and interview
-panels.
+week: a multi-day event where companies interview a large pool of shortlisted
+students across a limited set of rooms and interview panels.
 
-The core problem it solves has two parts. First, given realistic
-constraints — CGPA cutoffs, branch restrictions, limited rooms, limited
-panels, and heavily overlapping student shortlists — the system must
-produce an initial interview schedule and clearly report anything it could
-not fit, rather than failing silently. Second, real placement weeks are
-disrupted constantly: a panel drops out, a room becomes unusable, a student
-withdraws, a company arrives late. The system must repair the schedule
-around each disruption with the smallest possible amount of change, and
-report exactly what changed and who needs to be told.
+The system solves two related problems. First, it creates an initial interview
+schedule while respecting constraints such as CGPA cutoffs, branch
+restrictions, room availability, panel availability, interview duration, and
+student availability. Any shortlisted interviews that cannot be placed are
+reported instead of being silently dropped.
+
+Second, it handles common placement-week disruptions: a panel drops out, a room
+becomes unavailable, a student withdraws, or a company is delayed. The system
+tries to repair the affected interviews with the smallest possible change and
+reports exactly what was changed and who needs to be notified.
 
 ## 2. Key Features
 
-- **Realistic dataset generation** — companies are split into mass
-  recruiters, mid-tier, and dream-company tiers with different CGPA
-  cutoffs, branch restrictions, panel counts, and interview durations.
-  Students are generated with a bell-curve CGPA distribution, and each
-  student's shortlist count correlates with their CGPA, producing the kind
-  of overlapping-shortlist pressure a real placement week has.
-- **Interview scheduling** — a greedy, priority-ordered scheduler assigns
-  each eligible (student, company) shortlist pair to a specific panel, room,
-  and time slot, enforcing every hard constraint along the way.
-- **Student/panel/room constraints** — no student, panel, or room is ever
-  double-booked, and CGPA/branch eligibility is enforced both at data
-  generation and, independently, inside the scheduler itself.
-- **Unscheduled interview reporting** — when no valid slot exists for a
-  shortlisted pair, it is recorded with a specific reason rather than
-  dropped.
-- **Four disruption types** — panel drop, room block, student withdrawal,
-  and company delay, each handled by dedicated replanning logic.
-- **Tiered replanning** — panel drop, room block, and company delay each
-  attempt a repair ladder (cheapest fix first, wider search second, honest
-  failure third) before giving up on an affected interview.
-- **Coordinator dashboard** — a browser-based interface to generate a
-  schedule, inspect it, and trigger any of the four disruptions against the
-  live schedule.
+- **Realistic dataset generation** — companies are divided into mass
+  recruiters, mid-tier, and dream-company tiers with different CGPA cutoffs,
+  branch restrictions, panel counts, and interview durations. Students use a
+  bell-curve CGPA distribution, and shortlist counts correlate with CGPA to
+  create realistic overlapping demand.
+- **Interview scheduling** — a greedy, priority-ordered scheduler assigns each
+  eligible student-company pair to a panel, room, and time slot while enforcing
+  the hard constraints.
+- **Eligibility and resource constraints** — CGPA and branch eligibility are
+  checked, and students, panels, and rooms cannot be double-booked.
+- **Unscheduled interview reporting** — interviews that cannot be placed are
+  recorded with a reason rather than being silently discarded.
+- **Four disruption types** — panel drop, room block, student withdrawal, and
+  company delay.
+- **Tiered replanning** — panel drop, room block, and company delay use a repair
+  ladder that attempts the smallest change first, then a wider search, and
+  finally reports failure when no valid repair exists.
+- **Coordinator dashboard** — a browser-based interface allows a coordinator
+  to generate the schedule, inspect it, and trigger all four disruption types
+  against the live schedule.
 
 ## 3. Architecture / Project Structure
 
 | Package | Purpose |
 |---|---|
-| `model` | Core domain entities: `Company`, `Student`, `Panel`, `Room`, `Interview`, `TimeSlot`, `TimeGrid`, `PriorityTier`. Pure data plus the eligibility/time-grid logic that everything else builds on. |
-| `generator` | `DataGenerator` produces a realistic `Dataset` (companies, students, rooms) using a fixed random seed for reproducibility. |
-| `scheduler` | `SchedulingEngine` produces the initial interview schedule from a `Dataset`, using `OccupancyTracker` to enforce no-double-booking. Returns a `SchedulingResult` (scheduled interviews + unscheduled entries with reasons). |
-| `replan` | `ReplanEngine` handles all four disruption types, each with its own `Disruption` implementation, producing a `ReplanResult` (repair outcomes, locked count, notify list). |
-| `service` | `SchedulingStateService` — the only stateful component, holding the live dataset/engine/schedule across HTTP requests. |
-| `controller` | `PlacementController` — the 7 REST endpoints, each a thin delegation to the service. |
-| `dto` | Request objects used by the four disruption endpoints to keep API input separate from the domain disruption classes. |
+| `model` | Core domain entities: `Company`, `Student`, `Panel`, `Room`, `Interview`, `TimeSlot`, `TimeGrid`, and `PriorityTier`. |
+| `generator` | `DataGenerator` produces a reproducible `Dataset` containing companies, students, and rooms. |
+| `scheduler` | `SchedulingEngine` creates the initial schedule using `OccupancyTracker` and returns a `SchedulingResult` containing scheduled and unscheduled entries. |
+| `replan` | `ReplanEngine` handles the four disruption types using the corresponding `Disruption` implementations and produces `ReplanResult` objects. |
+| `service` | `SchedulingStateService` holds the live dataset, scheduling state, and replanning state across HTTP requests. |
+| `controller` | `PlacementController` exposes the REST API through seven endpoints. |
+| `dto` | Request objects used by the disruption endpoints to keep API input separate from the domain disruption classes. |
 
 ## 4. Scheduling Approach
 
-Every candidate (student, company) pair must pass a set of hard constraints
-before it is ever considered for a slot:
+Each shortlisted student-company pair is checked against the hard constraints
+before a slot is assigned:
 
 - The student meets the company's CGPA cutoff and branch restriction.
-- The student, the panel, and the room are all simultaneously free for the
-  entire duration of the interview.
-- The panel is active (not dropped).
+- The student is free for the complete interview duration.
+- The selected panel is active and free for the complete interview duration.
+- The selected room is free for the complete interview duration.
+- The interview is placed on the company's assigned day.
 
-Beyond these hard constraints, the order in which candidates are attempted
-is governed by a deliberate soft-priority ordering:
+Candidates are processed using a deliberate priority order:
 
-1. Students with **fewer total shortlists** are processed first — a
-   student with only one or two shortlisted companies has far less room
-   for error than a student shortlisted by ten, so they get first claim on
-   scarce slots.
-2. **Longer interview durations** are processed before shorter ones, so
-   short interviews can fill the gaps long ones leave behind rather than
-   fragmenting the day.
+1. Students with **fewer total shortlists** are processed first, because they
+   have fewer alternative opportunities if a slot is lost.
+2. **Longer interviews** are processed before shorter interviews to reduce
+   fragmentation of available time.
 3. **Earlier company day** is preferred among remaining ties.
-4. **Company tier** (mass recruiter, then mid-tier, then dream company) is
-   used as a further tie-break.
-5. A final deterministic tie-break on student ID and company ID ensures the
-   same input always produces the same schedule.
+4. **Company tier** is used as an additional tie-break.
+5. Student ID and company ID provide deterministic final tie-breaks.
 
-For each candidate, the scheduler searches every active panel and every
-room, at every valid start time on the company's assigned day, and books
-the first combination that satisfies every hard constraint. If none exists,
-the pair is recorded as unscheduled with a specific reason.
+For each candidate, the scheduler searches active panels and rooms across the
+valid start times for the company's assigned day. The first combination that
+satisfies all hard constraints is booked. If no valid combination exists, the
+candidate is recorded as unscheduled with a specific reason.
 
 ## 5. Replanning Approach
 
-Every disruption is handled using the same underlying model:
+Replanning separates interviews into two categories:
 
-- **LOCKED** — interviews unrelated to the disruption. These are never
-  touched, never re-examined, and never appear in the diff.
-- **AFFECTED** — interviews that can no longer proceed as scheduled because
-  the resource they depend on is gone or changed.
+- **LOCKED** — interviews unrelated to the disruption. They are left untouched.
+- **AFFECTED** — interviews that can no longer proceed because the disruption
+  has changed or removed a required resource.
 
-For panel drop, room block, and company delay, each affected interview goes
-through a repair ladder:
+For panel drop, room block, and company delay, affected interviews go through a
+repair ladder:
 
-1. **Tier 1** — the smallest possible fix: keep everything else about the
-   interview identical and change only the one thing that broke (the
-   panel, the room, or the start time, depending on the disruption).
-2. **Tier 2** — a wider search across other times (and, where applicable,
-   other panels/rooms), ranked by proximity to the original slot rather
-   than picked arbitrarily.
-3. **Tier 3** — no valid repair exists. The interview is left unscheduled
-   with a specific reason, never silently dropped.
+1. **Tier 1** — make the smallest possible change while keeping the rest of
+   the interview unchanged.
+2. **Tier 2** — perform a wider search across other valid times and, where
+   applicable, other panels or rooms.
+3. **Tier 3** — if no valid repair exists, leave the interview unscheduled and
+   report the reason.
 
-**Student withdrawal is handled differently on purpose.** It is not a
-repair problem — there is no alternative slot to search for, because the
-student is not looking for one. Every affected interview is recorded with a
-distinct `CANCELLED_WITHDRAWN` outcome rather than being run through the
-repair ladder or reported as a failed Tier 3 search, since those are
-semantically different situations for a coordinator reading the diff.
+**Student withdrawal is handled differently.** A withdrawn student does not
+need a replacement interview slot. Their affected interviews are therefore
+reported as `CANCELLED_WITHDRAWN` rather than as failed repairs.
 
-**Company delay respects a hard floor.** No repaired interview for a
-delayed company is ever placed before the delay threshold, regardless of
-how favorably an earlier slot might otherwise rank.
+**Company delay respects a hard floor.** A delayed company's repaired
+interviews are never placed before the specified delay threshold.
 
-**No-cascade principle:** a repair may only be placed into a slot that is
-already free. The system never displaces one already-scheduled interview
-to make room for another. If a repair would require bumping someone else,
-it is not attempted — the affected interview falls through to the next
-tier, or ultimately to Tier 3, instead.
+**No-cascade principle:** a repair is only placed into a slot that is already
+free. The system does not displace another scheduled interview to make room
+for a repair.
 
 ## 6. REST API
 
-| Method | Endpoint | Purpose | Request Body | Response |
-|---|---|---|---|---|
-| POST | `/api/schedule/generate` | Generates a new dataset and runs the initial scheduling pass, resetting all live state. | none | The full `SchedulingResult` (scheduled interviews + unscheduled entries). |
-| GET | `/api/schedule/interviews` | Returns the current live schedule. | none | List of `Interview`. |
-| GET | `/api/schedule/unscheduled` | Returns the interviews that could not be scheduled initially. | none | List of `UnscheduledEntry`. |
-| POST | `/api/replan/panel-drop` | Triggers a panel-drop disruption against the live schedule. | `{ "panelId": string, "day": int, "unit": int }` | The `ReplanResult` diff. |
-| POST | `/api/replan/room-block` | Triggers a room-block disruption. | `{ "roomId": string, "day": int, "unit": int }` | The `ReplanResult` diff. |
-| POST | `/api/replan/student-withdrawal` | Triggers a student withdrawing for the rest of the event. | `{ "studentId": string, "day": int, "unit": int }` | The `ReplanResult` diff. |
-| POST | `/api/replan/company-delay` | Triggers a company arriving late. | `{ "companyId": string, "delayUntilUnit": int }` | The `ReplanResult` diff. |
+| Method | Endpoint | Purpose | Request Body |
+|---|---|---|---|
+| POST | `/api/schedule/generate` | Generates a new dataset and initial schedule, resetting live state. | None |
+| GET | `/api/schedule/interviews` | Returns the current scheduled interviews. | None |
+| GET | `/api/schedule/unscheduled` | Returns the current unscheduled entries. | None |
+| POST | `/api/replan/panel-drop` | Applies a panel-drop disruption. | `{"panelId":"C1-P1","day":1,"unit":10}` |
+| POST | `/api/replan/room-block` | Applies a room-block disruption. | `{"roomId":"R1","day":1,"unit":10}` |
+| POST | `/api/replan/student-withdrawal` | Withdraws a student from the event. | `{"studentId":"S1","day":1,"unit":10}` |
+| POST | `/api/replan/company-delay` | Delays a company. | `{"companyId":"C31","delayUntilUnit":2}` |
 
-Each replan endpoint operates on the same live schedule produced by the
-most recent `/api/schedule/generate` call, and its effects persist for
-every subsequent request — disruptions accumulate rather than resetting.
+All replan endpoints operate on the same live schedule produced by the most
+recent `/api/schedule/generate` call. Disruptions therefore accumulate across
+requests instead of resetting the schedule.
 
 ## 7. Dashboard
 
-A single-page dashboard (`static/index.html`) lets a coordinator:
+The single-page dashboard provides:
 
-- Generate a new schedule and see summary counts (scheduled vs.
-  unscheduled).
-- Browse the full scheduled-interview list and the unscheduled list with
-  reasons.
-- Trigger any of the four disruption types through a dedicated form.
-- View the resulting diff after each disruption: which interviews were
-  repaired (and at which tier), which were cancelled or left unscheduled
-  and why, how many interviews were left untouched, and which students
-  need to be notified.
+- Schedule generation and summary counts.
+- A view of scheduled interviews.
+- A view of unscheduled interviews and their reasons.
+- Forms for all four disruption types.
+- Replan results showing affected interviews, repair tiers, cancellations or
+  unscheduled outcomes, locked interviews, and students who need notification.
 
 ## 8. How to Run
 
-Requirements: Java 21, Maven (or an IDE with Maven support, such as
-Eclipse).
+### Requirements
 
-From the project root:
+- Java 21
+- Maven
+- Eclipse or another Java IDE (optional)
 
-```
+### From the project root
+
+```bash
 mvn spring-boot:run
 ```
 
-Or, in Eclipse: right-click `PlacementSchedulerApplication.java` → Run As →
-Spring Boot App.
+### From Eclipse
 
-Once running, open:
+Run `PlacementSchedulerApplication.java` as a Spring Boot application.
 
-```
+Once the application starts, open:
+
+```text
 http://localhost:8080
 ```
 
-The dashboard is served automatically as the default static page.
+The dashboard is served as the default static page.
 
 ## 9. Verification
 
-The scheduling and replanning logic was verified using a set of dedicated
-Java demo runners (one per component: data generation, scheduling, and one
-per disruption type), each executed directly and inspected against
-expected outcomes before the REST layer was built on top of them. The REST
-API and dashboard were then verified by exercising all seven endpoints
-directly through the browser interface and confirming the results matched
-the demo runners' output.
+The scheduling and replanning logic was verified using dedicated Java demo
+runners for data generation, scheduling, and the individual disruption types.
+The REST API and dashboard were then exercised manually to confirm that the
+HTTP results matched the verified Java logic.
 
-With the fixed data-generation seed used throughout development, the
-scheduler consistently produces **707 scheduled interviews and 3,241
-unscheduled interviews** out of roughly 4,000 total shortlisted pairs. This
-reflects a genuine capacity constraint rather than a scheduling defect: the
-event's shared pool of 20 rooms cannot physically accommodate the full
-volume of demand, particularly on the first day, when the majority of
-mass-recruiter interviews are concentrated.
+With the fixed data-generation seed used during development, the scheduler
+produces:
 
-This same constraint shows up during replanning. A company delay applied
-to a heavily oversubscribed first-day company produced a full set of Tier 3
-(unscheduled) outcomes, while the identical, unmodified replanning logic
-applied to a lower-demand fourth-day company produced successful Tier 1
-repairs for every affected interview. Both outcomes were observed during
-testing. The difference is explained by the available capacity on the
-respective days: the heavily loaded Day 1 scenario had no feasible
-replacement, while the lower-demand Day 4 scenario had enough free capacity
-for Tier 1 repairs.
+- **707 scheduled interviews**
+- **3,241 unscheduled interviews**
+- Approximately **4,000 total shortlisted pairs**
 
-No automated test suite is included; verification was performed through
-the demo runners and manual exercise of the dashboard as described above.
+The high unscheduled count reflects the intentionally constrained placement
+week dataset and limited shared room capacity, particularly on Day 1 where
+mass recruiters create high demand.
+
+### Individual disruption tests
+
+Each disruption below was tested independently against a freshly generated
+schedule.
+
+| Disruption | Affected | Outcome |
+|---|---:|---|
+| Panel Drop (`C1-P1`, Day 1, unit 10) | 9 | 7 Tier 1 repairs, 2 Tier 3 unscheduled |
+| Room Block (`R1`, Day 1, unit 10) | 8 | 8 Tier 3 unscheduled |
+| Student Withdrawal (`S1`, Day 1, unit 10) | 3 | 3 `CANCELLED_WITHDRAWN` |
+| Company Delay, Day 1 company (`C1`, delay until unit 20) | 16 | 16 Tier 3 unscheduled |
+| Company Delay, Day 4 company (`C31`, delay until unit 2) | 4 | 4 Tier 1 repairs |
+
+The Day 1 and Day 4 company-delay cases demonstrate that the same replanning
+logic can produce different outcomes depending on the available capacity of
+the affected day.
+
+### Sequential state-persistence test
+
+The four disruption types were also triggered one after another through the
+dashboard without refreshing or regenerating the schedule. This confirmed
+that the live state is carried from one request to the next.
+
+| Step | Disruption | Affected | Locked | Schedule size after |
+|---:|---|---:|---:|---:|
+| 1 | Panel Drop (`C1-P1`, Day 1, unit 10) | 9 | 698 | 705 |
+| 2 | Room Block (`R1`, Day 1, unit 10) | 8 | 697 | 697 |
+| 3 | Student Withdrawal (`S1`, Day 1, unit 10) | 3 | 694 | 694 |
+| 4 | Company Delay (`C31`, delay until unit 2) | 4 | 690 | 694 |
+
+The locked count at each step matches the schedule size produced by the
+previous step, providing a simple check that the disruptions were applied to
+the cumulative live schedule rather than to a freshly generated schedule.
+
+No automated test suite is included. Verification was performed through the
+demo runners and manual dashboard testing.
 
 ## 10. Design Decisions
 
-**Why state is held in `SchedulingStateService`.** HTTP requests are
-stateless by nature, but the scheduling and replanning engines depend on
-live, mutating occupancy state that must persist between one disruption and
-the next. A single shared service instance holds the current dataset,
-scheduling engine, and replan engine, ensuring that a sequence of replan
-requests behaves the same way a sequence of operations within one program
-run would.
+### Why state is held in `SchedulingStateService`
 
-**Why withdrawal uses `CANCELLED_WITHDRAWN` instead of a failed repair.** A
-withdrawn student is not an interview the system failed to place — it is
-an interview that no longer needs to happen. Reporting it the same way as
-a failed search would misrepresent what actually occurred to anyone reading
-the diff.
+HTTP requests are stateless, but the scheduling and replanning engines use
+live, mutating occupancy state. `SchedulingStateService` therefore holds the
+current dataset, schedule, and engine state so that sequential disruptions
+operate on the evolving schedule.
 
-**Why freed slots are not automatically backfilled.** When an interview is
-cancelled or moved, the vacated slot is released but never proactively
-filled with some other unscheduled student. Doing so would mean silently
-re-solving part of the schedule beyond the original disruption, which
-conflicts with the goal of minimal, explainable disturbance.
+### Why withdrawal uses `CANCELLED_WITHDRAWN`
 
-**Why Tier 2 company-delay proximity is measured from the original
-interview time.** The delay threshold defines the earliest a replacement
-slot is allowed to start, but it does not change what the student
-originally expected. Ranking candidate slots by closeness to the original
-time — while strictly excluding anything before the delay floor — keeps
-the repair as close as possible to the student's original plan within
-what the delay actually permits.
+A withdrawn student does not need an alternative slot. Treating the cancelled
+interview as a failed repair would confuse two different situations: an
+interview that could not be scheduled and an interview that no longer needs
+to happen.
+
+### Why freed slots are not automatically backfilled
+
+When an interview is cancelled or moved, the released slot is not
+automatically given to another unscheduled student. This avoids silently
+re-solving the schedule beyond the requested disruption and keeps each replan
+small and explainable.
+
+### Why company-delay repairs stay close to the original time
+
+The delay threshold defines the earliest permitted replacement time, but the
+repair is still ranked by proximity to the original interview time. This
+keeps the repaired schedule as close as possible to the original plan while
+respecting the delay.
+
+### Verification demos
+
+The repository also contains small Java demo runners used during development
+to verify individual scheduling and replanning scenarios. They are retained
+as development/verification examples; the Spring REST layer uses the same
+core classes directly.
