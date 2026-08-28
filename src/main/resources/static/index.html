@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Placement Scheduler - Coordinator Dashboard</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; color: #222; }
+  h1 { font-size: 22px; }
+  h2 { font-size: 17px; margin-top: 28px; border-bottom: 1px solid #ccc; padding-bottom: 4px; }
+  .card { background: #fff; border: 1px solid #ddd; border-radius: 6px; padding: 16px; margin-bottom: 16px; }
+  button { background: #2b6cb0; color: #fff; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-size: 14px; }
+  button:hover { background: #1e4e80; }
+  .stats { display: flex; gap: 24px; margin-top: 10px; }
+  .stat { font-size: 14px; }
+  .stat b { font-size: 20px; display: block; }
+  table { border-collapse: collapse; width: 100%; margin-top: 10px; font-size: 13px; }
+  th, td { border: 1px solid #ddd; padding: 5px 8px; text-align: left; }
+  th { background: #eef2f7; }
+  tr:nth-child(even) { background: #fafafa; }
+  .scroll-box { max-height: 320px; overflow-y: auto; border: 1px solid #eee; }
+  .forms { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+  .form-block { border: 1px solid #eee; padding: 12px; border-radius: 4px; }
+  .form-block h3 { margin: 0 0 8px 0; font-size: 14px; }
+  .form-block input { width: 100%; padding: 5px; margin-bottom: 6px; box-sizing: border-box; }
+  .form-block textarea { width: 100%; padding: 5px; margin-bottom: 6px; box-sizing: border-box; font-family: inherit; font-size: 13px; }
+  .span-2 { grid-column: span 2; }
+  .tier-1 { color: #2f855a; font-weight: bold; }
+  .tier-2 { color: #b7791f; font-weight: bold; }
+  .tier-3, .cancelled { color: #c53030; font-weight: bold; }
+  #replanOutput, #status { white-space: pre-wrap; font-size: 13px; }
+  #status { color: #555; margin-left: 10px; }
+</style>
+</head>
+<body>
+
+<h1>Placement Scheduler - Coordinator Dashboard</h1>
+
+<div class="card">
+  <button onclick="generateSchedule()">Generate Schedule</button>
+  <span id="status"></span>
+  <div class="stats" id="stats"></div>
+</div>
+
+<div class="card">
+  <h2>Scheduled Interviews (<span id="interviewCount">0</span>)</h2>
+  <div class="scroll-box">
+    <table id="interviewsTable">
+      <thead><tr><th>Student</th><th>Company</th><th>Panel</th><th>Room</th><th>Day</th><th>Start Unit</th><th>End Unit</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Unscheduled (<span id="unscheduledCount">0</span>)</h2>
+  <div class="scroll-box">
+    <table id="unscheduledTable">
+      <thead><tr><th>Student</th><th>Company</th><th>Reason</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Trigger a Disruption</h2>
+  <div class="forms">
+
+    <div class="form-block">
+      <h3>Panel Drop</h3>
+      <input id="pd-panelId" placeholder="Panel ID (e.g. C1-P1)">
+      <input id="pd-day" type="number" placeholder="Day">
+      <input id="pd-unit" type="number" placeholder="Unit">
+      <button onclick="triggerPanelDrop()">Drop Panel</button>
+    </div>
+
+    <div class="form-block">
+      <h3>Room Block</h3>
+      <input id="rb-roomId" placeholder="Room ID (e.g. R1)">
+      <input id="rb-day" type="number" placeholder="Day">
+      <input id="rb-unit" type="number" placeholder="Unit">
+      <button onclick="triggerRoomBlock()">Block Room</button>
+    </div>
+
+    <div class="form-block span-2">
+      <h3>Student Withdrawal (one or many)</h3>
+      <textarea id="sw-studentIds" rows="3" placeholder="Student IDs - one per line or comma-separated (e.g. S1, S2, S3)"></textarea>
+      <input id="sw-day" type="number" placeholder="Day">
+      <input id="sw-unit" type="number" placeholder="Unit">
+      <button onclick="triggerWithdrawalBatch()">Withdraw Student(s)</button>
+    </div>
+
+    <div class="form-block span-2">
+      <h3>Company Delay</h3>
+      <input id="cd-companyId" placeholder="Company ID (e.g. C1)">
+      <input id="cd-unit" type="number" placeholder="Delay Until Unit">
+      <button onclick="triggerCompanyDelay()">Delay Company</button>
+    </div>
+
+  </div>
+</div>
+
+<div class="card">
+  <h2>Replan Result</h2>
+  <div id="replanOutput">No replan triggered yet.</div>
+</div>
+
+<script>
+const API = '/api';
+
+async function generateSchedule() {
+  setStatus('Generating...');
+  const res = await fetch(`${API}/schedule/generate`, { method: 'POST' });
+  if (!res.ok) { setStatus('Error: ' + await res.text()); return; }
+  const result = await res.json();
+  setStatus('Schedule generated.');
+  renderStats(result.scheduledInterviews.length, result.unscheduledEntries.length);
+  await refreshInterviews();
+  await refreshUnscheduled();
+}
+
+async function refreshInterviews() {
+  const res = await fetch(`${API}/schedule/interviews`);
+  if (!res.ok) return;
+  const interviews = await res.json();
+  document.getElementById('interviewCount').textContent = interviews.length;
+  const tbody = document.querySelector('#interviewsTable tbody');
+  tbody.innerHTML = interviews.map(i => `
+    <tr>
+      <td>${i.studentId}</td><td>${i.companyId}</td><td>${i.panelId}</td><td>${i.roomId}</td>
+      <td>${i.timeSlot.day}</td><td>${i.timeSlot.startUnit}</td><td>${i.timeSlot.endUnit}</td>
+    </tr>`).join('');
+}
+
+async function refreshUnscheduled() {
+  const res = await fetch(`${API}/schedule/unscheduled`);
+  if (!res.ok) return;
+  const entries = await res.json();
+  document.getElementById('unscheduledCount').textContent = entries.length;
+  const tbody = document.querySelector('#unscheduledTable tbody');
+  tbody.innerHTML = entries.map(e => `
+    <tr><td>${e.studentId}</td><td>${e.companyId}</td><td>${e.reason}</td></tr>`).join('');
+}
+
+function renderStats(scheduled, unscheduled) {
+  document.getElementById('stats').innerHTML = `
+    <div class="stat"><b>${scheduled}</b>Scheduled</div>
+    <div class="stat"><b>${unscheduled}</b>Unscheduled</div>
+  `;
+}
+
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg;
+}
+
+function tierClassOf(t) {
+  return t === 'TIER_1_SAME_SLOT_ALT_PANEL' ? 'tier-1'
+       : t === 'TIER_2_NEAREST_ALTERNATIVE' ? 'tier-2'
+       : t === 'CANCELLED_WITHDRAWN' ? 'cancelled' : 'tier-3';
+}
+
+function summarize(i) {
+  return `${i.studentId} / ${i.companyId} / ${i.panelId} / ${i.roomId} / Day ${i.timeSlot.day} [${i.timeSlot.startUnit}-${i.timeSlot.endUnit}]`;
+}
+
+async function postReplan(path, body) {
+  setStatus('Running replan...');
+  const res = await fetch(`${API}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    document.getElementById('replanOutput').textContent = 'Error: ' + await res.text();
+    setStatus('Replan failed.');
+    return;
+  }
+  const result = await res.json();
+  renderReplanResult(result);
+  setStatus('Replan complete.');
+  await refreshInterviews(); // reflect the merged diff
+}
+
+function renderReplanResult(result) {
+  const rows = result.repairOutcomes.map(o => `
+    <tr>
+      <td class="${tierClassOf(o.tier)}">${o.tier}</td>
+      <td>${summarize(o.originalInterview)}</td>
+      <td>${o.newInterview ? summarize(o.newInterview) : '-'}</td>
+      <td>${o.reason || '-'}</td>
+    </tr>`).join('');
+
+  document.getElementById('replanOutput').innerHTML = `
+    <p><b>Disruption:</b> ${JSON.stringify(result.disruption)}</p>
+    <p><b>Locked (untouched) interviews:</b> ${result.lockedInterviewCount}</p>
+    <p><b>Students to notify:</b> ${result.studentsToNotify.join(', ') || 'none'}</p>
+    <table>
+      <thead><tr><th>Tier</th><th>Original</th><th>New</th><th>Reason</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
+// Batch withdrawal: loops the SAME verified /api/replan/student-withdrawal
+// endpoint once per student ID, sequentially (awaited in order, not
+// parallel) so each call sees the previous one's result - this is a thin
+// UI convenience over an already-correct per-student operation, not new
+// business logic. Results from all calls are merged into one combined view.
+async function triggerWithdrawalBatch() {
+  const raw = document.getElementById('sw-studentIds').value;
+  const ids = raw.split(/[\n,]+/).map(s => s.trim()).filter(s => s.length > 0);
+  const day = parseInt(document.getElementById('sw-day').value);
+  const unit = parseInt(document.getElementById('sw-unit').value);
+
+  if (ids.length === 0) {
+    setStatus('Enter at least one student ID.');
+    return;
+  }
+
+  setStatus(`Running withdrawal for ${ids.length} student(s)...`);
+  const allOutcomes = [];
+  const notifySet = new Set();
+  let lastLocked = null;
+  const errors = [];
+
+  for (const studentId of ids) {
+    const res = await fetch(`${API}/replan/student-withdrawal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ studentId, day, unit })
+    });
+    if (!res.ok) {
+      errors.push(`${studentId}: ${await res.text()}`);
+      continue;
+    }
+    const result = await res.json();
+    allOutcomes.push(...result.repairOutcomes);
+    result.studentsToNotify.forEach(s => notifySet.add(s));
+    lastLocked = result.lockedInterviewCount;
+  }
+
+  renderBatchWithdrawalResult(ids.length, day, unit, allOutcomes, Array.from(notifySet).sort(), lastLocked, errors);
+  setStatus('Batch withdrawal complete.');
+  await refreshInterviews();
+}
+
+function renderBatchWithdrawalResult(studentCount, day, unit, outcomes, notifyList, lockedCount, errors) {
+  const rows = outcomes.map(o => `
+    <tr>
+      <td class="${tierClassOf(o.tier)}">${o.tier}</td>
+      <td>${summarize(o.originalInterview)}</td>
+      <td>${o.newInterview ? summarize(o.newInterview) : '-'}</td>
+      <td>${o.reason || '-'}</td>
+    </tr>`).join('');
+
+  const errorNote = errors.length
+    ? `<p style="color:#c53030"><b>Note:</b> ${errors.length} call(s) failed - ${errors.join('; ')}</p>`
+    : '';
+
+  document.getElementById('replanOutput').innerHTML = `
+    <p><b>Disruption:</b> Batch Student Withdrawal - ${studentCount} student(s), Day ${day}, unit ${unit}</p>
+    <p><b>Total cancelled interviews:</b> ${outcomes.length}</p>
+    <p><b>Locked (untouched) interviews after batch:</b> ${lockedCount}</p>
+    <p><b>Students to notify:</b> ${notifyList.join(', ') || 'none'}</p>
+    ${errorNote}
+    <table>
+      <thead><tr><th>Tier</th><th>Original</th><th>New</th><th>Reason</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
+function triggerPanelDrop() {
+  postReplan('/replan/panel-drop', {
+    panelId: document.getElementById('pd-panelId').value,
+    day: parseInt(document.getElementById('pd-day').value),
+    unit: parseInt(document.getElementById('pd-unit').value)
+  });
+}
+
+function triggerRoomBlock() {
+  postReplan('/replan/room-block', {
+    roomId: document.getElementById('rb-roomId').value,
+    day: parseInt(document.getElementById('rb-day').value),
+    unit: parseInt(document.getElementById('rb-unit').value)
+  });
+}
+
+function triggerCompanyDelay() {
+  postReplan('/replan/company-delay', {
+    companyId: document.getElementById('cd-companyId').value,
+    delayUntilUnit: parseInt(document.getElementById('cd-unit').value)
+  });
+}
+</script>
+
+</body>
+</html>
