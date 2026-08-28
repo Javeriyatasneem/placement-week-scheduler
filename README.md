@@ -155,7 +155,7 @@ Run `PlacementSchedulerApplication.java` as a Spring Boot application.
 Once the application starts, open:
 
 ```text
-http://localhost:8080
+http://localhost:8081
 ```
 
 The dashboard is served as the default static page.
